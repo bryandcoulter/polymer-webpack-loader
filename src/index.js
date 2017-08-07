@@ -1,15 +1,11 @@
 import url from 'url';
-import { getAttribute, predicates, query, queryAll, remove, removeFakeRootElements } from 'dom5';
+import { getAttribute, remove, removeFakeRootElements } from 'dom5';
 import loaderUtils from 'loader-utils';
 import { minify } from 'html-minifier';
 import parse5 from 'parse5';
-import espree from 'espree';
-import sourceMap from 'source-map';
-
-const domPred = predicates.AND(predicates.hasTagName('dom-module'));
-const linkPred = predicates.AND(predicates.hasTagName('link'));
-const scriptsPred = predicates.AND(predicates.hasTagName('script'));
-
+// import espree from 'espree';
+// import sourceMap from 'source-map';
+/* eslint class-methods-use-this: ["error", { "exceptMethods": ["scripts"] }] */
 class ProcessHtml {
   constructor(content, loader) {
     this.content = content;
@@ -21,25 +17,61 @@ class ProcessHtml {
    * Return transformed content as a bundle for webpack.
    */
   process() {
-    const links = this.links();
-    const doms = this.domModule();
-    return this.scripts(links.source + doms.source, links.lineCount + doms.lineCount);
-  }
-  /**
-   * Look for all `<link>` elements and turn them into `import` statements.
-   * e.g.
-   * ```
-   * <link rel="import" href="paper-input/paper-input.html">
-   * becomes:
-   * import 'paper-input/paper-input.html';
-   * ```
-   * @return {{source: string, lineCount: number}}
-   */
-  links() {
     const doc = parse5.parse(this.content, { locationInfo: true });
     removeFakeRootElements(doc);
-    const links = queryAll(doc, linkPred);
+    const linksArray = [];
+    const domModuleArray = [];
+    const scriptsArray = [];
+    const toBodyArray = [];
+    for (let x = 0; x < doc.childNodes.length; x++) {
+      const childNode = doc.childNodes[x];
+      if (childNode.tagName) {
+        if (childNode.tagName === 'dom-module') {
+          const domModuleChildNodes = childNode.childNodes;
+          for (let y = 0; y < domModuleChildNodes.length; y++) {
+            if (domModuleChildNodes[y].tagName === 'script') {
+              if (!ProcessHtml.isExternalPath(domModuleChildNodes[y], 'src')) {
+                scriptsArray.push(domModuleChildNodes[y]);
+              }
+            }
+          }
+          domModuleArray.push(childNode);
+        } else if (childNode.tagName === 'link') {
+          if (!ProcessHtml.isExternalPath(childNode, 'href')) {
+            linksArray.push(childNode);
+          } else {
+            toBodyArray.push(childNode);
+          }
+        } else if (childNode.tagName === 'script') {
+          if (!ProcessHtml.isExternalPath(childNode, 'src')) {
+            scriptsArray.push(childNode);
+          } else {
+            toBodyArray.push(childNode);
+          }
+        } else {
+          toBodyArray.push(childNode);
+        }
+      }
+    }
 
+
+    const links = this.links(linksArray);
+    const scripts = this.scripts(scriptsArray);
+    const toBody = ProcessHtml.buildRuntimeSource(toBodyArray, 'toBody');
+
+    scriptsArray.forEach((scriptNode) => {
+      remove(scriptNode);
+    });
+    const domModules = ProcessHtml.buildRuntimeSource(domModuleArray, 'register');
+    const addRegisterImport = (toBodyArray.length > 0 || domModuleArray.length > 0) ? '\nconst RegisterHtmlTemplate = require(\'polymer-webpack-loader/register-html-template\');\n' : '';
+
+    const source = links.source + addRegisterImport + domModules.source + toBody.source + scripts.source;
+    const sourceMap = '';
+    return { source, sourceMap };
+  }
+
+
+  links(links) {
     let source = '';
     const ignoreLinks = this.options.ignoreLinks || [];
     const ignoreLinksFromPartialMatches = this.options.ignoreLinksFromPartialMatches || [];
@@ -57,9 +89,7 @@ class ProcessHtml {
         }
 
         const ignoredFromPartial = ignoreLinksFromPartialMatches.filter(partial => href.indexOf(partial) >= 0);
-        const parseLink = url.parse(href);
-        const isExternalLink = parseLink.protocol || parseLink.slashes;
-        if (ignoreLinks.indexOf(href) < 0 && ignoredFromPartial.length === 0 && !isExternalLink) {
+        if (ignoreLinks.indexOf(href) < 0 && ignoredFromPartial.length === 0) {
           source += `\nimport '${path}';\n`;
           lineCount += 2;
         }
@@ -70,99 +100,20 @@ class ProcessHtml {
       lineCount,
     };
   }
-  /**
-   * Looks for all `<dom-module>` elements, removing any `<script>`'s without a
-   * `src` and any `<link>` tags, as these are processed in separate steps.
-   * @return {{source: string, lineCount: number}}
-   */
-  domModule() {
-    const doc = parse5.parse(this.content, { locationInfo: true });
-    removeFakeRootElements(doc);
-    const domModule = query(doc, domPred);
-    const scripts = queryAll(doc, scriptsPred);
+
+  scripts(scripts) {
+    // const sourceMapGenerator = null;
+    let lineCount = 0;
+    let source = '';
     scripts.forEach((scriptNode) => {
       const src = getAttribute(scriptNode, 'src') || '';
       if (src) {
-        const parseSrc = url.parse(src);
-        if (!parseSrc.protocol || !parseSrc.slashes) {
-          remove(scriptNode);
-        }
-      } else {
-        remove(scriptNode);
-      }
-    });
-    const links = queryAll(doc, linkPred);
-    links.forEach((linkNode) => {
-      const href = getAttribute(linkNode, 'href') || '';
-      const parseLink = url.parse(href);
-      const isExternalLink = parseLink.protocol || parseLink.slashes;
-      if (!isExternalLink) {
-        remove(linkNode);
-      }
-    });
-    const html = domModule ? domModule.parentNode : doc;
-    const minimized = minify(parse5.serialize(html), {
-      collapseWhitespace: true,
-      conservativeCollapse: true,
-      minifyCSS: true,
-      removeComments: true,
-    });
-    if (minimized) {
-      if (domModule) {
-        return {
-          source: `
-const RegisterHtmlTemplate = require('polymer-webpack-loader/register-html-template');
-RegisterHtmlTemplate.register(${JSON.stringify(minimized)});
-`,
-          lineCount: 3,
-        };
-      }
-      return {
-        source: `
-const RegisterHtmlTemplate = require('polymer-webpack-loader/register-html-template');
-RegisterHtmlTemplate.toBody(${JSON.stringify(minimized)});
-`,
-        lineCount: 3,
-      };
-    }
-    return {
-      source: '',
-      lineCount: 0,
-    };
-  }
-  /**
-   * Look for all `<script>` elements. If the script has a valid `src` attribute
-   * it will be converted to an `import` statement.
-   * e.g.
-   * ```
-   * <script src="foo.js">
-   * becomes:
-   * import 'foo';
-   * ```
-   * Otherwise if it's an inline script block, the content will be serialized
-   * and returned as part of the bundle.
-   * @param {string} initialSource previously generated JS
-   * @param {number} initialLineOffset number of lines already in initialSource
-   * @return {{source: string, sourceMap: Object=}}
-   */
-  scripts(initialSource, initialLineOffset) {
-    let lineOffset = initialLineOffset;
-    const doc = parse5.parse(this.content, { locationInfo: true });
-    removeFakeRootElements(doc);
-    const scripts = queryAll(doc, scriptsPred);
-    let source = initialSource;
-    let sourceMapGenerator = null;
-    scripts.forEach((scriptNode) => {
-      const src = getAttribute(scriptNode, 'src') || '';
-      if (src) {
-        const parseSrc = url.parse(src);
-        if (!parseSrc.protocol || !parseSrc.slashes) {
-          const path = ProcessHtml.checkPath(src);
-          source += `\nimport '${path}';\n`;
-          lineOffset += 2;
-        }
+        const path = ProcessHtml.checkPath(src);
+        source += `\nimport '${path}';\n`;
+        lineCount += 2;
       } else {
         const scriptContents = parse5.serialize(scriptNode);
+        /*
         sourceMapGenerator = sourceMapGenerator || new sourceMap.SourceMapGenerator();
         const tokens = espree.tokenize(scriptContents, {
           loc: true,
@@ -185,7 +136,7 @@ RegisterHtmlTemplate.toBody(${JSON.stringify(minimized)});
               column: token.loc.start.column + (token.loc.start.line === 1 ? firstLineCharOffset : 0),
             },
             generated: {
-              line: token.loc.start.line + lineOffset,
+              line: token.loc.start.line + lineCount,
               column: token.loc.start.column,
             },
             source: this.currentFilePath,
@@ -197,25 +148,67 @@ RegisterHtmlTemplate.toBody(${JSON.stringify(minimized)});
 
           sourceMapGenerator.addMapping(mapping);
         });
+        */
         source += `\n${scriptContents}\n`;
         // eslint-disable-next-line no-underscore-dangle
-        lineOffset += 2 + (scriptNode.__location.endTag.line - scriptNode.__location.startTag.line);
+        lineCount += 2 + (scriptNode.__location.endTag.line - scriptNode.__location.startTag.line);
       }
     });
-    const retVal = {
+    return {
       source,
+      lineCount,
     };
-    if (sourceMapGenerator) {
-      sourceMapGenerator.setSourceContent(this.currentFilePath, this.content);
-      retVal.sourceMap = sourceMapGenerator.toJSON();
-    }
-    return retVal;
+  }
+
+  static buildRuntimeSource(nodes, type) {
+    let lineCount = 0;
+    let source = '';
+    nodes.forEach((node) => {
+      const parseObject = {
+        childNodes: [node],
+      };
+
+      const minimized = minify(parse5.serialize(parseObject), {
+        collapseWhitespace: true,
+        conservativeCollapse: true,
+        minifyCSS: true,
+        removeComments: true,
+      });
+
+      source += `
+RegisterHtmlTemplate.${type}(${JSON.stringify(minimized)});
+`;
+      lineCount += 2;
+    });
+
+    return {
+      source,
+      lineCount,
+    };
+  }
+
+  static isExternalPath(node, pathType) {
+    const path = getAttribute(node, pathType) || '';
+    const parseLink = url.parse(path);
+    return parseLink.protocol || parseLink.slashes;
   }
 
   static checkPath(path) {
     const needsAdjusted = /^[A-Za-z]{1}/.test(path);
     return needsAdjusted ? `./${path}` : path;
   }
+
+
+  /**
+   * Look for all `<link>` elements and turn them into `import` statements.
+   * e.g.
+   * ```
+   * <link rel="import" href="paper-input/paper-input.html">
+   * becomes:
+   * import 'paper-input/paper-input.html';
+   * ```
+   * @return {{source: string, lineCount: number}}
+   */
 }
 
 // eslint-disable-next-line no-unused-vars
